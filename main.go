@@ -54,37 +54,25 @@ func (ctx *httpAuthRandom) OnHttpRequestHeaders(numHeaders int, _ bool) types.Ac
 			return types.ActionPause
 		}
 	}
-
-	if numHeaders > 0 {
-		headers, err := proxywasm.GetHttpRequestHeaders()
+	authHeader, _ := proxywasm.GetHttpRequestHeader("Authorization")
+	if authHeader == "" {
+		proxywasm.LogWarn("no auth header")
+		return types.ActionContinue
+	}
+	tokenString, err := extractToken(authHeader)
+	if err != nil {
+		proxywasm.LogErrorf("error extracting token %v", err)
+		return types.ActionContinue
+	}
+	claims, err := decodeToken(tokenString, keySetCache)
+	if err != nil {
+		proxywasm.LogErrorf("error decoding token %v", err)
+		return types.ActionContinue
+	}
+	for k, v := range sanitizedHeaders {
+		err = proxywasm.AddHttpRequestHeader(k, fmt.Sprint(claims.Header[v]))
 		if err != nil {
-			proxywasm.LogErrorf("error reading headers %v", err)
-			return types.ActionContinue
-		}
-		var authHeader string
-		for i := range headers {
-			if headers[i][0] == "Authorization" {
-				authHeader = headers[i][1]
-				break
-			}
-		}
-		if authHeader != "" {
-			tokenString, err := extractToken(authHeader)
-			if err != nil {
-				proxywasm.LogErrorf("error extracting token %v", err)
-				return types.ActionContinue
-			}
-			claims, err := decodeToken(tokenString, keySetCache)
-			if err != nil {
-				proxywasm.LogErrorf("error decoding token %v", err)
-				return types.ActionContinue
-			}
-			for k, v := range sanitizedHeaders {
-				err = proxywasm.AddHttpRequestHeader(k, fmt.Sprint(claims.Header[v]))
-				if err != nil {
-					proxywasm.LogErrorf("error adding header [%s:%s] %v", k, claims.Header[v], err)
-				}
-			}
+			proxywasm.LogErrorf("error adding header [%s:%s] %v", k, claims.Header[v], err)
 		}
 	}
 	return types.ActionContinue
