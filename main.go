@@ -6,12 +6,14 @@ import (
 	"github.com/golang-jwt/jwt"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tetratelabs/proxy-wasm-go-sdk/proxywasm/types"
-	"log"
-	"os"
 	"strings"
+	"time"
 )
 
 var sanitizedHeaders = map[string]string{"org": "org", "user_uuid": "user_uuid", "principal_type": "principal_type"}
+var keySetCache map[string]jwk
+
+const tick = 15 * time.Second
 
 func main() {
 	proxywasm.SetVMContext(&vmContext{})
@@ -44,36 +46,44 @@ func (ctx *httpAuthRandom) OnHttpRequestHeaders(numHeaders int, _ bool) types.Ac
 	for k, _ := range sanitizedHeaders {
 		err := proxywasm.RemoveHttpRequestHeader(k)
 		if err != nil {
-			log.Println(err)
+			proxywasm.LogErrorf("error sanitizing headers %v", err)
+			err = proxywasm.SendHttpResponse(500, nil, []byte("error sanitizing headers"), -1)
+			if err != nil {
+				panic(err)
+			}
 			return types.ActionPause
 		}
 	}
 
-	headers, err := proxywasm.GetHttpRequestHeaders()
-	if err != nil {
-		log.Println(err)
-		return types.ActionContinue
-	}
 	if numHeaders > 0 {
-		headerMap := map[string]string{}
+		headers, err := proxywasm.GetHttpRequestHeaders()
+		if err != nil {
+			proxywasm.LogErrorf("error reading headers %v", err)
+			return types.ActionContinue
+		}
+		var authHeader string
 		for i := range headers {
-			headerMap[headers[i][0]] = headers[i][1]
+			if headers[i][0] == "Authorization" {
+				authHeader = headers[i][1]
+				break
+			}
 		}
-		tokenString, err := extractToken(headerMap["Authorization"])
-		if err != nil {
-			log.Println(err)
-			return types.ActionContinue
-		}
-		claims, err := decodeToken(tokenString)
-		if err != nil {
-			log.Println(err)
-			return types.ActionContinue
-		}
-		claimMap := claims.(map[string]interface{})
-		for k, v := range sanitizedHeaders {
-			err = proxywasm.AddHttpRequestHeader(k, fmt.Sprint(claimMap[v]))
+		if authHeader != "" {
+			tokenString, err := extractToken(authHeader)
 			if err != nil {
-				log.Println(err)
+				proxywasm.LogErrorf("error extracting token %v", err)
+				return types.ActionContinue
+			}
+			claims, err := decodeToken(tokenString, keySetCache)
+			if err != nil {
+				proxywasm.LogErrorf("error decoding token %v", err)
+				return types.ActionContinue
+			}
+			for k, v := range sanitizedHeaders {
+				err = proxywasm.AddHttpRequestHeader(k, fmt.Sprint(claims.Header[v]))
+				if err != nil {
+					proxywasm.LogErrorf("error adding header [%s:%s] %v", k, claims.Header[v], err)
+				}
 			}
 		}
 	}
@@ -88,14 +98,41 @@ func extractToken(authHeader string) (string, error) {
 	return parts[1], nil
 }
 
-func decodeToken(tokenString string) (interface{}, error) {
+func decodeToken(tokenString string, keySet map[string]jwk) (*jwt.Token, error) {
 	return jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		// Don't forget to validate the alg is what you expect:
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-
-		// hmacSampleSecret is a []byte containing your secret, e.g. []byte("my_secret_key")
-		return os.Getenv("TOKEN_SECRET"), nil
+		kid, ok := token.Header["kid"].(string)
+		if !ok {
+			return nil, errors.New("kid header not found")
+		}
+		if _, ok := keySet[kid]; !ok {
+			return nil, fmt.Errorf("key %v not found", kid)
+		}
+		return token, nil
 	})
+}
+
+func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
+	if err := proxywasm.SetTickPeriodMilliSeconds(uint32(tick.Milliseconds())); err != nil {
+		proxywasm.LogCriticalf("failed to set tick period: %v", err)
+		return types.OnPluginStartStatusFailed
+	}
+	return types.OnPluginStartStatusOK
+}
+
+func (ctx *pluginContext) OnTick() {
+	//TODO cache jwks
+}
+
+type jwk struct {
+	Alg string   `json:"alg"`
+	Kty string   `json:"kty"`
+	Use string   `json:"use"`
+	X5C []string `json:"x5c"`
+	N   string   `json:"n"`
+	E   string   `json:"e"`
+	Kid string   `json:"kid"`
+	X5T string   `json:"x5t"`
 }
